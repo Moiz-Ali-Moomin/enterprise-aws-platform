@@ -1,0 +1,30 @@
+{
+    "description": "Simulate AZ failure by stopping all ECS tasks in a specific subnet",
+    "stopConditions": [
+        {
+            "source": "none"
+        }
+    ],
+    "actions": {
+        "stopTasks": {
+            "actionId": "aws:ecs:stop-task",
+            "parameters": {
+                "cluster": "enterprise-cluster",
+                "service": "api-service"
+            },
+            "targets": {
+                "Tasks": "allTasks"
+            }
+        }
+    },
+    "targets": {
+        "allTasks": {
+            "resourceType": "aws:ecs:task",
+            "resourceArns": [
+                "arn:aws:ecs:us-east-1:123456789012:task/enterprise-cluster/*"
+            ],
+            "selectionMode": "ALL"
+        }
+    },
+    "roleArn": "arn:aws:iam::123456789012:role/FISRole"
+}

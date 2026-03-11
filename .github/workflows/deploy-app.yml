@@ -1,0 +1,151 @@
+name: Deploy — Application
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "services/**"
+
+# ════════════════════════════════════════════════
+# FIX #5: Parameterized — set these per-environment.
+# For staging deployments from main, use staging resources.
+# To deploy to prod, use a separate prod workflow or
+# trigger on a release tag.
+# ════════════════════════════════════════════════
+env:
+  AWS_REGION: us-east-1
+  # FIX #5: Project name used for constructing all resource names
+  PROJECT_NAME: ecs-enterprise
+  # FIX #5: Target environment (staging for main branch pushes)
+  ENVIRONMENT: staging
+  # FIX #5: Resource names derived from project + environment
+  ECR_REPOSITORY: ecs-enterprise-staging
+  ECS_CLUSTER: ecs-enterprise-staging-cluster
+  ECS_SERVICE: ecs-enterprise-staging-service
+  CONTAINER_NAME: app
+
+permissions:
+  contents: read
+  id-token: write  # Required for OIDC authentication
+
+jobs:
+  deploy:
+    name: Build, Scan & Deploy to Staging
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: |
+          IMAGE_TAG="sha-${{ github.sha }}"
+          FULL_IMAGE="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}"
+          LATEST_IMAGE="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest"
+          echo "image-tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "full-image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          echo "latest-image=${LATEST_IMAGE}" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg GIT_SHA=${{ github.sha }} \
+            -t ${{ steps.meta.outputs.full-image }} \
+            ./services/api-service
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.full-image }}
+          format: "table"
+          exit-code: "1"
+          severity: "CRITICAL,HIGH"
+          timeout: "10m"
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.meta.outputs.full-image }}
+          artifact-name: sbom-${{ github.sha }}.spdx.json
+          output-file: sbom.spdx.json
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Push image to ECR (SHA tag + latest)
+        run: |
+          docker push ${{ steps.meta.outputs.full-image }}
+          # Also push :latest for ECS service to reference on first deploy
+          docker tag ${{ steps.meta.outputs.full-image }} ${{ steps.meta.outputs.latest-image }}
+          docker push ${{ steps.meta.outputs.latest-image }}
+
+      - name: Sign container image with Cosign (keyless)
+        run: |
+          cosign sign --yes \
+            ${{ steps.meta.outputs.full-image }}
+
+      - name: Download current task definition
+        run: |
+          # FIX #6: Task family = PROJECT_NAME-ENVIRONMENT-task
+          # Previously used ECS_CLUSTER-task which produced the WRONG name
+          TASK_FAMILY="${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}-task"
+          echo "Looking up task definition family: ${TASK_FAMILY}"
+
+          aws ecs describe-task-definition \
+            --task-definition ${TASK_FAMILY} \
+            --query 'taskDefinition' \
+            --output json > task-definition.json
+
+          # Strip read-only fields that cannot be re-registered
+          python3 -c "
+          import json
+          with open('task-definition.json') as f:
+              td = json.load(f)
+          for key in ['taskDefinitionArn','revision','status','registeredAt',
+                      'registeredBy','requiresAttributes','compatibilities']:
+              td.pop(key, None)
+          with open('task-definition.json', 'w') as f:
+              json.dump(td, f, indent=2)
+          print('Task definition prepared successfully')
+          "
+
+      - name: Render new task definition with updated image
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.meta.outputs.full-image }}
+
+      - name: Deploy to ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: 15
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment:** ${{ env.ENVIRONMENT }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** \`${{ steps.meta.outputs.full-image }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cluster:** \`${{ env.ECS_CLUSTER }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Service:** \`${{ env.ECS_SERVICE }}\`" >> $GITHUB_STEP_SUMMARY
+          ALB_DNS=$(aws elbv2 describe-load-balancers \
+            --query "LoadBalancers[?contains(LoadBalancerName,'${{ env.PROJECT_NAME }}-${{ env.ENVIRONMENT }}')].DNSName" \
+            --output text 2>/dev/null || echo "N/A")
+          echo "- **Public URL:** http://${ALB_DNS}/health" >> $GITHUB_STEP_SUMMARY

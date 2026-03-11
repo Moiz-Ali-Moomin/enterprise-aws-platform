@@ -1,0 +1,45 @@
+# ADOT Collector Configuration
+# This file is stored in SSM Parameter Store at:
+#   /{project_name}/{environment}/adot-config
+# and injected into the ADOT sidecar container via
+# the AOT_CONFIG_CONTENT environment variable.
+# See terraform/modules/ecs/main.tf for SSM parameter resource.
+
+extensions:
+  health_check:
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch/traces:
+    timeout: 1s
+    send_batch_size: 50
+  batch/metrics:
+    timeout: 60s
+
+exporters:
+  awsxray:
+    region: us-east-1
+  awsemf:
+    region: us-east-1
+    log_group_name: '/aws/ecs/metrics'
+    log_stream_name: 'otel-metrics'
+    dimension_rollup_option: NoDimensionRollup
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch/traces]
+      exporters: [awsxray]
+    metrics:
+      receivers: [otlp]
+      processors: [batch/metrics]
+      exporters: [awsemf]
+  extensions: [health_check]

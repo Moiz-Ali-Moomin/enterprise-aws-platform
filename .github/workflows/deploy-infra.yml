@@ -1,0 +1,219 @@
+name: Deploy — Infrastructure
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  # ────────────────────────────────────────────────
+  # PR Validation — plan all environments
+  # ────────────────────────────────────────────────
+  terraform-plan:
+    name: Terraform Plan (${{ matrix.environment }})
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, staging, prod]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7"
+
+      - name: Terraform Init (${{ matrix.environment }})
+        run: terraform init
+        working-directory: terraform/environments/${{ matrix.environment }}
+
+      - name: Terraform Plan (${{ matrix.environment }})
+        id: plan
+        run: terraform plan -var-file=${{ matrix.environment }}.tfvars -no-color -input=false 2>&1 | tee plan-output.txt
+        working-directory: terraform/environments/${{ matrix.environment }}
+
+      - name: Post plan to PR
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('terraform/environments/${{ matrix.environment }}/plan-output.txt', 'utf8');
+            const truncated = planOutput.length > 65000 ? planOutput.substring(0, 65000) + '\n... truncated' : planOutput;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## Terraform Plan — \`${{ matrix.environment }}\`\n\`\`\`hcl\n${truncated}\n\`\`\``
+            });
+
+  # ────────────────────────────────────────────────
+  # FIX #7: Deploy Dev — auto (no approval)
+  # ────────────────────────────────────────────────
+  deploy-dev:
+    name: Deploy Dev Infrastructure
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # 'development' environment — no required reviewers
+    environment: development
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7"
+
+      - name: Deploy Dev
+        run: |
+          cd terraform/environments/dev
+          terraform init
+          terraform apply -var-file=dev.tfvars -auto-approve -input=false
+
+  # ────────────────────────────────────────────────
+  # FIX #7: Deploy Staging — auto after dev passes
+  # ────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy Staging Infrastructure
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    # 'staging' environment — no required reviewers
+    environment: staging
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7"
+
+      - name: Deploy Staging
+        run: |
+          cd terraform/environments/staging
+          terraform init
+          terraform apply -var-file=staging.tfvars -auto-approve -input=false
+
+  # ────────────────────────────────────────────────
+  # FIX #7: Deploy Prod — REQUIRES MANUAL APPROVAL
+  # + FIX NEW-D: Generate plan artifact for review
+  # Configure in GitHub: Settings > Environments >
+  # "production" > Required reviewers
+  # ────────────────────────────────────────────────
+  plan-prod:
+    name: Plan Production Infrastructure
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7"
+
+      - name: Terraform Init (prod)
+        run: terraform init
+        working-directory: terraform/environments/prod
+
+      - name: Terraform Plan (prod)
+        run: |
+          terraform plan -var-file=prod.tfvars -no-color -input=false -out=tfplan 2>&1 | tee plan-output.txt
+        working-directory: terraform/environments/prod
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-terraform-plan
+          path: |
+            terraform/environments/prod/tfplan
+            terraform/environments/prod/plan-output.txt
+          retention-days: 7
+
+      - name: Plan summary
+        run: |
+          echo "## Production Terraform Plan" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat terraform/environments/prod/plan-output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  deploy-prod:
+    name: Deploy Production Infrastructure
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: plan-prod
+    runs-on: ubuntu-latest
+    # 'production' environment — MUST have Required reviewers configured
+    # in GitHub repository Settings > Environments > production
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: prod-terraform-plan
+          path: terraform/environments/prod
+
+      - name: Deploy Production
+        run: |
+          cd terraform/environments/prod
+          terraform init
+          terraform apply -auto-approve -input=false tfplan

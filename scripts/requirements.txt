@@ -1,0 +1,4 @@
+boto3
+ansible
+ansible-core
+amazon.aws

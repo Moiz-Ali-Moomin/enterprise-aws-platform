@@ -1,0 +1,25 @@
+openapi: 3.0.0
+info:
+  title: Hardened Enterprise API
+  version: 1.0.0
+  description: Mission-critical API for the global SaaS platform.
+paths:
+  /order:
+    post:
+      summary: Place a new order
+      description: Buffers the order via SQS for asynchronous processing.
+      responses:
+        '202':
+          description: Order accepted
+  /health:
+    get:
+      summary: Service Health
+      responses:
+        '200':
+          description: Healthy
+  /ready:
+    get:
+      summary: Service Readiness
+      responses:
+        '200':
+          description: Ready to serve traffic

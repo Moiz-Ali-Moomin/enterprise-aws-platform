@@ -1,0 +1,15 @@
+# Checkov Policy Override Example
+# Enforce encrypted S3 buckets across the entire organization
+
+metadata:
+  name: "Enforce S3 Encryption"
+  id: "ELITE-GLOBAL-001"
+  severity: "CRITICAL"
+scope:
+  resource: "aws_s3_bucket"
+definition:
+  and:
+    - cond: "server_side_encryption_configuration"
+      exists: true
+    - cond: "server_side_encryption_configuration.rule.apply_server_side_encryption_by_default.sse_algorithm"
+      eq: "aws:kms"

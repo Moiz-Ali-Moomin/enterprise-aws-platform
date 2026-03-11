@@ -1,0 +1,60 @@
+# ─── Terraform ─────────────────────────────────
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfstate.*.backup
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+*.auto.tfvars
+terraform_apply_out.txt
+
+# Keep lock files — they pin provider versions
+!.terraform.lock.hcl
+
+# ─── Python ────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+*.pyc
+*.pyo
+*.pyd
+
+# ─── Docker ────────────────────────────────────
+*.tar
+
+# ─── OS ────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Archives ──────────────────────────────────
+*.zip
+
+# ─── Logs ──────────────────────────────────────
+*.log
+
+# ─── Sensitive / Secrets ───────────────────────
+secrets.json
+*.pem
+*.key
+*.tfvars
+*.tfvars.json
+
+# Keep environment-specific tfvars (they don't contain secrets)
+!**/environments/*/*.tfvars
+
+# ─── IDE ───────────────────────────────────────
+.vscode/
+.idea/

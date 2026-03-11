@@ -1,0 +1,108 @@
+name: CI — Pull Request Validation
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-test:
+    name: Lint & Test — Python
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: services/api-service
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: services/api-service/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest httpx ruff
+
+      - name: Lint with Ruff
+        run: ruff check src/ tests/
+
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short
+
+  terraform-validate:
+    name: Terraform Validate (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, staging, prod]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7"
+
+      - name: Terraform Format Check
+        # Check formatting on all tf files (excludes .terraform/ dirs)
+        run: terraform fmt -check -recursive terraform/
+        continue-on-error: true  # Non-blocking — format is enforced by pre-commit
+
+      - name: Terraform Init — backend disabled (${{ matrix.environment }})
+        run: terraform init -backend=false
+        working-directory: terraform/environments/${{ matrix.environment }}
+
+      - name: Terraform Validate (${{ matrix.environment }})
+        run: terraform validate
+        working-directory: terraform/environments/${{ matrix.environment }}
+
+      - name: tfsec Security Scan
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working_directory: terraform/
+          soft_fail: false
+
+  docker-build-scan:
+    name: Docker Build & Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg GIT_SHA=${{ github.sha }} \
+            -t pr-test:${{ github.sha }} \
+            ./services/api-service
+
+      - name: Test health endpoint
+        run: |
+          docker run -d --name test-container -p 8000:8000 pr-test:${{ github.sha }}
+          sleep 10
+          curl -sf http://localhost:8000/health || (docker logs test-container && exit 1)
+          docker stop test-container
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: "pr-test:${{ github.sha }}"
+          format: "table"
+          exit-code: "1"
+          severity: "CRITICAL,HIGH"
+          timeout: "10m"
