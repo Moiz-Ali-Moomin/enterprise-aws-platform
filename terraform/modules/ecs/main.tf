@@ -210,6 +210,14 @@ resource "aws_ecs_task_definition" "app" {
         {
           name  = "UVICORN_WORKERS"
           value = tostring(var.uvicorn_workers)
+        },
+        {
+          name  = "SQS_QUEUE_URL"
+          value = var.sqs_queue_url
+        },
+        {
+          name  = "DATABASE_URL"
+          value = var.database_url
         }
       ]
       logConfiguration = {

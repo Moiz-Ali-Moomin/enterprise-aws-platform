@@ -117,6 +117,17 @@ module "ecs" {
   min_capacity          = 1
   max_capacity          = 3
   uvicorn_workers       = 1
+  sqs_queue_url         = module.sqs.queue_url
+}
+
+############################################
+# SQS — Order Processing Queue
+############################################
+
+module "sqs" {
+  source       = "../../modules/sqs"
+  project_name = var.project_name
+  environment  = "dev"
 }
 
 ############################################

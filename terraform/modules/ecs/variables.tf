@@ -103,6 +103,25 @@ variable "uvicorn_workers" {
   default     = 2
 }
 
+variable "sqs_queue_url" {
+  description = "SQS queue URL passed to the application as SQS_QUEUE_URL env var. Empty string disables SQS."
+  type        = string
+  default     = ""
+}
+
+variable "database_url" {
+  description = "Database connection URL passed as DATABASE_URL env var. Uses SQLite by default."
+  type        = string
+  default     = "sqlite+aiosqlite:///./app.db"
+}
+
+variable "secret_key" {
+  description = "JWT signing secret. Should be sourced from Secrets Manager in production."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
 variable "kms_key_arn" {
   description = "KMS key ARN for encrypting CloudWatch log groups. If empty, encryption is skipped."
   type        = string
