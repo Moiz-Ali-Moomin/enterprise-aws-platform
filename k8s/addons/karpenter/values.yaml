@@ -1,0 +1,83 @@
+# Karpenter — Helm Values
+#
+# Karpenter: Next-generation Kubernetes node autoscaler
+# that replaces Cluster Autoscaler for EKS workloads.
+#
+# Key differences from Cluster Autoscaler:
+#   Cluster Autoscaler: scales existing EC2 Auto Scaling Groups
+#     - Slow (ASG cooldown periods, typically 5–15 minutes)
+#     - Limited to pre-configured instance types in the ASG
+#     - No bin-packing; doesn't consolidate underutilized nodes
+#
+#   Karpenter: directly calls EC2 API (RunInstances/CreateFleet)
+#     - Fast (nodes join cluster in < 60 seconds typically)
+#     - Flexible: picks the cheapest instance with available capacity
+#       from a family (t3, m5, c5, etc.) at launch time
+#     - Consolidation: terminates underutilized nodes to save cost
+#     - Spot-aware: handles 2-min interruption notices via SQS
+#
+# Reference: https://karpenter.sh
+
+# EKS cluster name — Karpenter watches this cluster's unschedulable pods
+settings:
+  clusterName: "${EKS_CLUSTER_NAME}"
+  clusterEndpoint: "${EKS_CLUSTER_ENDPOINT}"
+  # SQS queue for EC2 Spot interruption events
+  # Created by Terraform (aws_sqs_queue.karpenter_interruption)
+  interruptionQueueName: "${KARPENTER_INTERRUPTION_QUEUE_NAME}"
+
+serviceAccount:
+  create: true
+  name: karpenter
+  annotations:
+    # IRSA: links the karpenter SA to the Terraform-created karpenter IAM role
+    # Get from: terraform output -raw karpenter_role_arn
+    eks.amazonaws.com/role-arn: "${KARPENTER_IRSA_ROLE_ARN}"
+
+# Two replicas for HA — Karpenter is a critical cluster component
+replicas: 2
+
+# Controller resource limits
+controller:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+
+# Webhook (handles NodePool validation)
+webhook:
+  enabled: true
+
+# Anti-affinity: spread Karpenter replicas across nodes
+# so a single node failure doesn't take down both replicas
+affinity:
+  nodeAffinity:
+    # Karpenter should run on ON_DEMAND nodes (not Spot)
+    # so it's available to handle Spot interruptions
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: karpenter.sh/capacity-type
+              operator: In
+              values:
+                - on-demand
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: karpenter
+        topologyKey: kubernetes.io/hostname
+
+# Tolerations: Karpenter may need to run before NodePools are active
+# (bootstrapping), so we tolerate the initial node taint
+tolerations:
+  - key: CriticalAddonsOnly
+    operator: Exists
+  - effect: NoSchedule
+    key: node.kubernetes.io/not-ready
+    operator: Exists
+
+logLevel: info

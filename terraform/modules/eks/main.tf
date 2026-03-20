@@ -824,3 +824,359 @@ resource "aws_iam_role_policy" "api_service" {
     ]
   })
 }
+
+############################################
+# SQS — Karpenter Spot Interruption Queue
+#
+# Karpenter's interruption handler listens for
+# EC2 Spot interruption notices, rebalance
+# recommendations, and instance state changes
+# via EventBridge → SQS.
+#
+# When Karpenter receives an interruption signal
+# for a Spot node, it proactively:
+#   1. Cordons the node (no new pods scheduled)
+#   2. Drains the node (evicts existing pods)
+#   3. Terminates the node
+# This gives workloads a full ~2 minutes to
+# gracefully shut down before forced interruption.
+#
+# Without this: pods are killed with no warning.
+# With this: graceful shutdown, zero data loss.
+############################################
+
+resource "aws_sqs_queue" "karpenter_interruption" {
+  name                      = "${var.project_name}-${var.environment}-karpenter-interruption"
+  message_retention_seconds = 300 # 5 minutes — interruption notices expire quickly
+
+  # Protect against accidental queue deletion
+  # (losing the queue means losing interruption handling)
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-karpenter-interruption"
+    Environment = var.environment
+    ManagedBy   = "karpenter"
+  }
+}
+
+resource "aws_sqs_queue_policy" "karpenter_interruption" {
+  queue_url = aws_sqs_queue.karpenter_interruption.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowEventBridgeToSendMessages"
+        Effect = "Allow"
+        Principal = {
+          Service = [
+            "events.amazonaws.com",
+            "sqs.amazonaws.com"
+          ]
+        }
+        Action   = "sqs:SendMessage"
+        Resource = aws_sqs_queue.karpenter_interruption.arn
+      }
+    ]
+  })
+}
+
+############################################
+# EventBridge Rules — Spot Interruption Notifications
+#
+# These rules route AWS lifecycle events to the
+# Karpenter SQS queue. Karpenter's controller
+# polls the queue and acts on them.
+#
+# Events captured:
+#   SpotInterruptionWarning: 2-min Spot eviction notice
+#   RebalanceRecommendation: AWS recommends proactive rebalance
+#   InstanceStateChange:     EC2 instance terminated/stopped
+#   ScheduledChange:         AWS planned maintenance
+############################################
+
+resource "aws_cloudwatch_event_rule" "karpenter_spot_interruption" {
+  name        = "${var.project_name}-${var.environment}-karpenter-spot-interruption"
+  description = "Karpenter: EC2 Spot Instance Interruption Warning"
+
+  event_pattern = jsonencode({
+    source      = ["aws.ec2"]
+    detail-type = ["EC2 Spot Instance Interruption Warning"]
+  })
+}
+
+resource "aws_cloudwatch_event_rule" "karpenter_rebalance" {
+  name        = "${var.project_name}-${var.environment}-karpenter-rebalance"
+  description = "Karpenter: EC2 Instance Rebalance Recommendation"
+
+  event_pattern = jsonencode({
+    source      = ["aws.ec2"]
+    detail-type = ["EC2 Instance Rebalance Recommendation"]
+  })
+}
+
+resource "aws_cloudwatch_event_rule" "karpenter_instance_state" {
+  name        = "${var.project_name}-${var.environment}-karpenter-instance-state"
+  description = "Karpenter: EC2 Instance State Change"
+
+  event_pattern = jsonencode({
+    source      = ["aws.ec2"]
+    detail-type = ["EC2 Instance State-change Notification"]
+  })
+}
+
+resource "aws_cloudwatch_event_rule" "karpenter_scheduled_change" {
+  name        = "${var.project_name}-${var.environment}-karpenter-scheduled-change"
+  description = "Karpenter: AWS Health Scheduled Change"
+
+  event_pattern = jsonencode({
+    source      = ["aws.health"]
+    detail-type = ["AWS Health Event"]
+  })
+}
+
+# Route all Karpenter events to the SQS queue
+resource "aws_cloudwatch_event_target" "karpenter_spot_interruption" {
+  rule = aws_cloudwatch_event_rule.karpenter_spot_interruption.name
+  arn  = aws_sqs_queue.karpenter_interruption.arn
+}
+
+resource "aws_cloudwatch_event_target" "karpenter_rebalance" {
+  rule = aws_cloudwatch_event_rule.karpenter_rebalance.name
+  arn  = aws_sqs_queue.karpenter_interruption.arn
+}
+
+resource "aws_cloudwatch_event_target" "karpenter_instance_state" {
+  rule = aws_cloudwatch_event_rule.karpenter_instance_state.name
+  arn  = aws_sqs_queue.karpenter_interruption.arn
+}
+
+resource "aws_cloudwatch_event_target" "karpenter_scheduled_change" {
+  rule = aws_cloudwatch_event_rule.karpenter_scheduled_change.name
+  arn  = aws_sqs_queue.karpenter_interruption.arn
+}
+
+############################################
+# IRSA — Karpenter Controller
+#
+# Karpenter needs broad EC2 permissions because
+# it manages the ENTIRE node lifecycle:
+#   - Launch: RunInstances, CreateFleet
+#   - Terminate: TerminateInstances
+#   - Describe: to find available capacity
+#   - Tag: to track ownership
+#   - IAM PassRole: to assign instance profiles
+#   - SQS: to read interruption queue
+#   - SSM: to fetch latest EKS-optimized AMI IDs
+#
+# This is wider than Cluster Autoscaler (which only
+# calls SetDesiredCapacity on existing ASGs).
+# Karpenter trades narrower permissions for better
+# bin-packing and faster scale-out (direct EC2 API).
+#
+# Trust condition: only the "karpenter" ServiceAccount
+# in the "karpenter" namespace can assume this role.
+############################################
+
+resource "aws_iam_role" "karpenter" {
+  name = "${var.project_name}-${var.environment}-karpenter-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = "sts:AssumeRoleWithWebIdentity"
+      Principal = {
+        Federated = aws_iam_openid_connect_provider.eks.arn
+      }
+      Condition = {
+        StringEquals = {
+          "${local.oidc_issuer_host}:sub" = "system:serviceaccount:karpenter:karpenter"
+          "${local.oidc_issuer_host}:aud" = "sts.amazonaws.com"
+        }
+      }
+    }]
+  })
+################################################################################
+# AWS WAFv2 — Application Firewall for EKS ALB
+#
+# Provides an 'Elite' layer of protection against:
+#   1. SQL Injection (SQLi)
+#   2. Cross-site scripting (XSS)
+#   3. Common vulnerabilities (Log4j, etc.)
+#   4. High-frequency request floods (Rate Limiting)
+#
+# The ALB Controller will associate this WebACL with the Ingress ALB
+# via the 'alb.ingress.kubernetes.io/wafv2-acl-arn' annotation.
+################################################################################
+
+resource "aws_wafv2_web_acl" "eks" {
+  name        = "${var.project_name}-${var.environment}-eks-waf"
+  description = "WAF for ${var.project_name} EKS ALB Ingress"
+  scope       = "REGIONAL" # Regional for ALB (not CloudFront)
+
+  default_action {
+    allow {}
+  }
+
+  visibility_config {
+    cloudwatch_metrics_enabled = true
+    metric_name                = "${var.project_name}-${var.environment}-waf-metrics"
+    sampled_requests_enabled   = true
+  }
+
+  # Rule 1: AWS Managed Core Rule Set (protects against common exploits)
+  rule {
+    name     = "AWS-AWSManagedRulesCommonRuleSet"
+    priority = 1
+
+    override_action {
+      none {}
+    }
+
+    statement {
+      managed_rule_group_statement {
+        name        = "AWSManagedRulesCommonRuleSet"
+        vendor_name = "AWS"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "AWS-AWSManagedRulesCommonRuleSet"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  # Rule 2: Rate Limiting (Elite protection against request floods)
+  rule {
+    name     = "RateLimit"
+    priority = 2
+
+    action {
+      block {}
+    }
+
+    statement {
+      rate_based_statement {
+        limit              = 2000 # Max 2000 requests per 5 minutes per IP
+        aggregate_key_type = "IP"
+      }
+    }
+
+    visibility_config {
+      cloudwatch_metrics_enabled = true
+      metric_name                = "RateLimit"
+      sampled_requests_enabled   = true
+    }
+  }
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-eks-waf"
+    Environment = var.environment
+  }
+}
+
+output "waf_web_acl_arn" {
+  description = "ARN of the WAFv2 WebACL for the EKS Ingress"
+  value       = aws_wafv2_web_acl.eks.arn
+}
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-karpenter-role"
+    Environment = var.environment
+  }
+}
+
+resource "aws_iam_role_policy" "karpenter" {
+  name = "${var.project_name}-${var.environment}-karpenter-policy"
+  role = aws_iam_role.karpenter.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # EC2: Karpenter creates and manages node instances directly
+        # (not via ASG like Cluster Autoscaler)
+        Sid    = "EC2NodeLaunchAndTerminate"
+        Effect = "Allow"
+        Action = [
+          "ec2:CreateLaunchTemplate",
+          "ec2:CreateFleet",
+          "ec2:RunInstances",
+          "ec2:CreateTags",
+          "ec2:TerminateInstances",
+          "ec2:DeleteLaunchTemplate",
+          "ec2:DescribeLaunchTemplates",
+          "ec2:DescribeInstances",
+          "ec2:DescribeSecurityGroups",
+          "ec2:DescribeSubnets",
+          "ec2:DescribeImages",
+          "ec2:DescribeInstanceTypes",
+          "ec2:DescribeInstanceTypeOfferings",
+          "ec2:DescribeAvailabilityZones",
+          "ec2:DescribeSpotPriceHistory"
+        ]
+        Resource = "*"
+      },
+      {
+        # IAM: Karpenter must pass the node instance profile to EC2
+        # so launched nodes can assume the node role for ECR, CW, etc.
+        Sid    = "IAMPassRoleForNodes"
+        Effect = "Allow"
+        Action = ["iam:PassRole"]
+        Resource = aws_iam_role.eks_node_group.arn
+      },
+      {
+        # SQS: read from the interruption queue for Spot handling
+        Sid    = "SQSInterruptionQueue"
+        Effect = "Allow"
+        Action = [
+          "sqs:DeleteMessage",
+          "sqs:GetQueueUrl",
+          "sqs:GetQueueAttributes",
+          "sqs:ReceiveMessage"
+        ]
+        Resource = aws_sqs_queue.karpenter_interruption.arn
+      },
+      {
+        # SSM: fetch latest EKS-optimised AMI IDs for the current K8s version
+        # Karpenter uses SSM Parameter Store to resolve AMI IDs dynamically
+        # instead of hardcoding AMI IDs that rot over time.
+        Sid    = "SSMAMILookup"
+        Effect = "Allow"
+        Action = ["ssm:GetParameter"]
+        Resource = "arn:aws:ssm:*:*:parameter/aws/service/eks/optimized-ami/*"
+      },
+      {
+        # Pricing: Karpenter queries EC2 Spot pricing to make cost-aware
+        # instance selection decisions (picks cheapest instance with capacity)
+        Sid      = "EC2SpotPricing"
+        Effect   = "Allow"
+        Action   = ["pricing:GetProducts"]
+        Resource = "*"
+      },
+      {
+        # EKS: Karpenter needs to know the cluster endpoint and cert to
+        # bootstrap new nodes into the cluster
+        Sid      = "EKSDescribeCluster"
+        Effect   = "Allow"
+        Action   = ["eks:DescribeCluster"]
+        Resource = aws_eks_cluster.main.arn
+      }
+    ]
+  })
+}
+
+# Instance profile: Karpenter attaches this to EC2 instances it launches.
+# It must use the same role as the managed node group so Karpenter nodes
+# have the same ECR/CW/CNI permissions as the existing node group.
+resource "aws_iam_instance_profile" "karpenter_node" {
+  name = "${var.project_name}-${var.environment}-karpenter-node-profile"
+  role = aws_iam_role.eks_node_group.name
+
+  tags = {
+    Name        = "${var.project_name}-${var.environment}-karpenter-node-profile"
+    Environment = var.environment
+  }
+}

@@ -219,3 +219,120 @@ Once pushed, an image tag (e.g., `sha-abc1234`) cannot be overwritten. This prev
 | **Change Management** | All infra changes via Terraform PR + CI | Git history, Terraform plan artifacts |
 | **Incident Response** | PagerDuty/SNS alerts, runbooks in `docs/runbooks/` | CloudWatch alarms, SNS topics |
 | **Data Classification** | Secrets Manager for credentials, no PII in logs | Application-level log filtering |
+
+---
+
+## Enhanced Kubernetes Runtime Hardening (Elite)
+
+### Pod Security Standards (PSS) — Restricted Profile
+We enforce the **Restricted** PSS profile at the namespace level via labels. This is the highest level of security for Kubernetes pods:
+- **No Privileged Containers**: Prevents containers from gaining root-level access to the host.
+- **No Host Networking**: Containers cannot access the node's network stack.
+- **No Host Path mounts**: Prevents reading/writing files on the node's OS.
+- **Rootless Execution**: Forces containers to run with a non-root UID (User ID).
+
+### Resource Governance
+To prevent **Resource Exhaustion (DoS)** and ensure cluster stability:
+- **ResourceQuotas**: Cap the total CPU and Memory the `api-service` namespace can consume.
+- **LimitRanges**: Enforce default requests/limits for all containers, ensuring no 'naked' pods can be scheduled.
+
+### Perimeter Protection — AWS WAFv2
+All EKS traffic passing through the ALB is inspected by **AWS WAFv2**:
+- **Managed Core Rule Set**: Automatic protection against SQLi, XSS, and common exploits.
+- **Rate Limiting**: Throttles IPs that exceed 2,000 requests per 5 minutes, preventing layer-7 DDoS.
+- **Integration**: Associated automatically with the ALB via Ingress annotations.
+
+
+---
+
+## Kubernetes Runtime Security
+
+This section covers security controls specific to the EKS compute path. ECS controls are documented in the sections above.
+
+### NetworkPolicy — Zero-Trust Pod Isolation
+
+Without NetworkPolicies, all pods in an EKS cluster can communicate freely with all other pods and all AWS services. This violates the least-privilege principle at the network layer.
+
+This platform implements a **default-deny policy set** for the `api-service` namespace:
+
+```
+Default: DENY ALL ingress  +  DENY ALL egress
+  │
+  ├── ALLOW ingress: from ALB (port 8000) only
+  ├── ALLOW egress:  DNS (port 53, kube-system CoreDNS)
+  ├── ALLOW egress:  AWS services via VPC endpoints (HTTPS :443, private IPs)
+  └── ALLOW egress:  RDS PostgreSQL (port 5432, private subnet)
+```
+
+**What a compromised pod CANNOT do** with this policy:
+- Reach other namespaces (etcd, kube-system, other teams' namespaces)
+- Query the Kubernetes API server
+- Port-scan other pods
+- Connect to external internet endpoints (S3 public, external APIs)
+
+**CNI enforcement requirement**: NetworkPolicies are only enforced when the CNI supports them. Enable the VPC CNI network policy addon:
+```bash
+aws eks update-addon --cluster-name <name> \
+  --addon-name vpc-cni \
+  --configuration-values '{"networkPolicy":{"enabled":true}}'
+```
+
+### IRSA — Per-Pod IAM Identity
+
+On a standard EC2 node, all pods share the **node instance profile** — if any pod is compromised, an attacker gets all the permissions of every AWS SDK call the node can make (S3, EC2, SQS, etc.).
+
+With IRSA:
+
+```
+Standard EC2 (without IRSA):
+  All pods → Node instance role → ALL node permissions
+
+EKS with IRSA:
+  api-service pod   → api-service role  → SQS + X-Ray + CloudWatch only
+  ESO pod           → ESO role          → Secrets Manager read-only
+  ALB Controller    → ALB role          → ELBv2 management only
+  Karpenter         → Karpenter role    → EC2 lifecycle only
+  Other pods        → No AWS identity   → No AWS API access
+```
+
+A compromised `api-service` pod cannot access S3, EC2, RDS secrets, or any other AWS API outside its scoped policy.
+
+### PodDisruptionBudget — Availability During Disruptions
+
+The PDB ensures Kubernetes will not voluntarily evict all pods simultaneously during:
+- Node drain operations (kubectl drain, Karpenter consolidation)
+- Rolling deployments
+- EKS managed node group updates
+
+```yaml
+# api-service PDB
+spec:
+  minAvailable: 1   # At least 1 pod must always be Running and Ready
+```
+
+At `minReplicas: 2`, this means:
+- Normal: 2 pods running
+- During drain/consolidation: 1 pod always serving traffic while replacement starts
+- PDB is enforced by the Kubernetes eviction API — Karpenter respects it automatically
+
+### No Node-Level Credentials Exposed to Pods
+
+The node IAM role (attached to Karpenter-launched and managed nodes) has the minimal permissions required for node operation:
+
+| Permission | Why |
+|---|---|
+| `AmazonEKSWorkerNodePolicy` | Register with EKS control plane |
+| `AmazonEKS_CNI_Policy` | Allocate pod IPs via VPC CNI |
+| `AmazonEC2ContainerRegistryReadOnly` | Pull container images from ECR |
+| `CloudWatchAgentServerPolicy` | Send Container Insights metrics |
+
+Pods access node-level credentials via the **Instance Metadata Service (IMDS)**. To prevent credential theft via SSRF:
+
+```bash
+# EKS automatically limits hop count to 1, preventing pod-level IMDS access
+# when IRSA is enabled. Pods with IRSA SA annotations get IRSA tokens instead.
+# Additional hardening: set IMDSv2 required on EC2NodeClass
+```
+
+The `EC2NodeClass` should set `metadataOptions` to enforce IMDSv2 and restrict hop count, preventing container-level IMDS access via SSRF exploits.
+

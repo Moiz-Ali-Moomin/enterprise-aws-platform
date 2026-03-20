@@ -7,6 +7,19 @@ metadata:
     kubernetes.io/metadata.name: api-service
     environment: "${ENVIRONMENT}"
     app.kubernetes.io/part-of: enterprise-aws-platform
+
+    # Pod Security Standards (PSS) — Elite Guardrails
+    # These labels enforce the 'restricted' profile on all pods in this namespace.
+    # Prevents: privileged pods, hostNetwork, hostPath, root users, etc.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+    # FinOps — Cost Attribution
+    cost-center: platform
+    team: backend
+    env: "${ENVIRONMENT}"
+
     # This annotation enables ADOT pod discovery for CloudWatch Container Insights
     # and tells the ADOT collector to scrape Prometheus metrics from pods in this namespace
     aws.amazon.com/cloudwatch-agent-scrape-interval: "30s"

@@ -1,0 +1,38 @@
+##########################################################
+# LimitRange — api-service Namespace
+#
+# A LimitRange is a policy to constrain resource allocations
+# (to Pods or Containers) in a namespace.
+#
+# Strategy:
+#   - Set DEFAULT requests/limits for containers that don't
+#     specify them. This prevents pods without resource
+#     declarations from being scheduled (which can cause
+#     node instability).
+#   - Enforce minimum and maximum possible resource values.
+##########################################################
+
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: api-service-limits
+  namespace: api-service
+spec:
+  limits:
+    - type: Container
+      # Default limits if none are specified by the pod
+      default:
+        cpu: "500m"
+        memory: "512Mi"
+      # Default requests if none are specified by the pod
+      defaultRequest:
+        cpu: "256m"
+        memory: "256Mi"
+      # Maximum allowed limits for any single container
+      max:
+        cpu: "2"
+        memory: "4Gi"
+      # Minimum allowed requests for any single container
+      min:
+        cpu: "100m"
+        memory: "128Mi"

@@ -1,0 +1,63 @@
+##########################################################
+# PodDisruptionBudget — api-service
+#
+# A PDB limits how many pods can be simultaneously
+# unavailable during VOLUNTARY disruptions. It is the
+# Kubernetes mechanism that prevents downtime during:
+#
+#   - Node drain (kubectl drain, Karpenter consolidation)
+#   - Rolling deployments (Deployment controller)
+#   - Voluntary node upgrades (EKS managed node group updates)
+#   - Cluster autoscaler scale-in
+#
+# WITHOUT a PDB:
+#   - A node drain evicts ALL pods with no limit
+#   - If all replicas happen to be on the same node,
+#     the service goes down completely
+#   - Rolling updates can momentarily take down all replicas
+#
+# WITH a PDB (minAvailable: 1):
+#   - Kubernetes guarantees at least 1 pod is always Running
+#   - Node drain waits (up to terminationGracePeriodSeconds)
+#     before evicting a pod if doing so would violate the PDB
+#   - Karpenter's consolidation respects PDB before terminating
+#     Spot or underutilized nodes
+#
+# PDB does NOT protect against INVOLUNTARY disruptions:
+#   - Hardware failures
+#   - Spot interruption 2-min warning (that's Karpenter's job)
+#   - OOMKill (that's resource limits' job)
+#   - Node panic/kernel crash
+#
+# minAvailable vs maxUnavailable:
+#   minAvailable: 1 = at least 1 pod must remain healthy
+#   maxUnavailable: 1 = at most 1 pod may be unavailable
+#   For 2 replicas, these are equivalent.
+#   For 10 replicas: minAvailable=1 allows 9 simultaneous
+#   evictions (too permissive). maxUnavailable=1 is better.
+#   We use minAvailable=1 as a safe floor for small deployments.
+##########################################################
+
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-service-pdb
+  namespace: api-service
+  labels:
+    app: api-service
+    app.kubernetes.io/name: api-service
+    app.kubernetes.io/part-of: enterprise-aws-platform
+spec:
+  # At least 1 pod must be Available at all times during voluntary disruptions.
+  # "Available" means: Running, Ready, and passing readiness probes.
+  # This matches our HPA minReplicas=2, ensuring genuine HA:
+  #   - Normal state:      2 pods Running
+  #   - During node drain: eviction waits until replacement is Ready
+  #   - After eviction:    1 pod Running → PDB triggers wait before next eviction
+  minAvailable: 1
+
+  # Selects the pods this PDB protects.
+  # Must match the label on the Deployment's pod template.
+  selector:
+    matchLabels:
+      app: api-service

@@ -1,0 +1,164 @@
+##########################################################
+# Karpenter NodePool
+#
+# A NodePool defines the scheduling constraints and
+# resource limits for nodes Karpenter can provision.
+# It replaces the Cluster Autoscaler's Node Group config.
+#
+# NodePool vs EC2NodeClass:
+#   NodePool:      Kubernetes-level constraints
+#                  (which pods, taint/toleration, limits)
+#   EC2NodeClass:  AWS-level config
+#                  (subnet, security group, AMI, instance profile)
+#
+# Karpenter picks the cheapest instance type from the
+# allowed families that has:
+#   - Sufficient CPU and memory to fit the pending pod
+#   - Available Spot capacity (if spot allowed)
+#
+# Multi-family (t3, t3a, m5, m5a, c5):
+#   Why? If t3.large has no Spot capacity, Karpenter can
+#   pick m5.large (same vCPU/RAM profile, different family).
+#   This dramatically reduces Spot interruptions — AWS
+#   can always find capacity across 5+ instance families.
+##########################################################
+
+apiVersion: karpenter.sh/v1beta1
+kind: NodePool
+metadata:
+  name: default
+  labels:
+    app.kubernetes.io/part-of: enterprise-aws-platform
+spec:
+  ##########################################################
+  # Template: defines what nodes look like
+  ##########################################################
+  template:
+    metadata:
+      labels:
+        # These labels appear on nodes Karpenter launches.
+        # Useful for nodeSelector and anti-affinity rules.
+        karpenter.sh/nodepool: default
+        environment: "${ENVIRONMENT}"
+
+    spec:
+      ##########################################################
+      # NodeClass reference: points to EC2NodeClass below
+      ##########################################################
+      nodeClassRef:
+        apiVersion: karpenter.k8s.aws/v1beta1
+        kind: EC2NodeClass
+        name: default
+
+      ##########################################################
+      # Requirements: which instances Karpenter can provision
+      #
+      # Using In/NotIn operators on well-known labels.
+      # Karpenter queries EC2 pricing and capacity in real-time
+      # and picks the cheapest available combination.
+      ##########################################################
+      requirements:
+        # Instance families: general-purpose (t3, m5) + compute (c5)
+        # Include t3a (AMD) and m5a for additional Spot diversity
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values:
+            - t3.medium
+            - t3.large
+            - t3.xlarge
+            - t3a.medium
+            - t3a.large
+            - t3a.xlarge
+            - m5.large
+            - m5.xlarge
+            - m5a.large
+            - m5a.xlarge
+            - c5.large
+            - c5.xlarge
+
+        # Allow both Spot and On-Demand.
+        # Karpenter picks Spot for cost savings and falls back
+        # to On-Demand if Spot capacity is unavailable.
+        # Override with capacity-type nodeSelector on critical pods.
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values:
+            - spot
+            - on-demand
+
+        # Only provision in private availability zones
+        # (subnet selection is handled by EC2NodeClass)
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values:
+            - "${AWS_REGION}a"
+            - "${AWS_REGION}b"
+            - "${AWS_REGION}c"
+
+        # Only amd64 architecture — our container images are linux/amd64
+        # Add arm64 and Graviton instances if building multi-arch images
+        - key: kubernetes.io/arch
+          operator: In
+          values:
+            - amd64
+
+        # Linux operating system (required for EKS optimized AMI)
+        - key: kubernetes.io/os
+          operator: In
+          values:
+            - linux
+
+      ##########################################################
+      # Taints: prevent regular workloads from scheduling on
+      # Karpenter-provisioned nodes unless they have a matching
+      # toleration. Omit this block for general-purpose nodes.
+      ##########################################################
+      # taints:
+      #   - key: karpenter.sh/nodepool
+      #     value: default
+      #     effect: NoSchedule
+
+      ##########################################################
+      # Node expiry: automatically recycle nodes older than N days
+      # Forces AMI updates and security patches without manual drain.
+      # expireAfter: 168h  # 7 days
+      ##########################################################
+
+  ##########################################################
+  # Disruption: Karpenter's consolidation settings
+  #
+  # Consolidation: Karpenter reviews nodes and terminates
+  # underutilized ones by moving pods to other nodes.
+  # This eliminates the "zombie node" problem where Cluster
+  # Autoscaler leaves empty nodes running.
+  #
+  # consolidationPolicy:
+  #   WhenUnderutilized: remove nodes that can be bin-packed
+  #   WhenEmpty:         only remove completely empty nodes
+  ##########################################################
+  ##########################################################
+  # Disruption: Karpenter's consolidation/expiry settings
+  #
+  # consolidationPolicy:
+  #   WhenEmpty:         Only remove completely empty nodes (more conservative)
+  #   WhenUnderutilized: Remove nodes that can be bin-packed (more aggressive)
+  #
+  # expireAfter:
+  #   Automatically recycle nodes older than N days.
+  #   Forces AMI updates and security patches automatically.
+  ##########################################################
+  disruption:
+    consolidationPolicy: WhenEmpty
+    # Minimum time a node must exist before consolidation runs.
+    consolidateAfter: 300s
+    # Automatically recycle nodes older than 30 days (720h).
+    # This prevents 'node rot' and ensures periodic AMI refreshes.
+    expireAfter: 720h
+
+  ##########################################################
+  # Resource limits: cap on total compute Karpenter can provision.
+  # Prevents runaway costs if there's a pod scheduling bug.
+  ##########################################################
+  limits:
+    cpu: "20"        # 20 vCPU max cap (Elite guardrail)
+    memory: 80Gi     # 80 GiB RAM max cap (Elite guardrail)

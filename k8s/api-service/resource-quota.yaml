@@ -1,0 +1,34 @@
+##########################################################
+# ResourceQuota — api-service Namespace
+#
+# A ResourceQuota provides constraints that limit aggregate
+# resource consumption per namespace. It can limit the quantity
+# of objects that can be created by type, as well as the total
+# amount of compute resources that may be consumed by resources
+# in that project.
+#
+# Strategy:
+#   - Cap CPU and Memory to prevent a single namespace from
+#     exhausting the entire cluster's capacity.
+#   - Ensure runaway HPA or misconfigured pods are throttled
+#     at the namespace boundary.
+##########################################################
+
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: api-service-quota
+  namespace: api-service
+spec:
+  hard:
+    # Aggregated CPU and Memory requests limit for the namespace
+    requests.cpu: "4"        # Max 4 vCPUs allocated
+    requests.memory: 8Gi     # Max 8 GiB RAM allocated
+
+    # Aggregated CPU and Memory limits for the namespace
+    # Limits are typically set higher than requests or equal
+    limits.cpu: "8"          # Max 8 vCPUs burst
+    limits.memory: 16Gi      # Max 16 GiB RAM burst
+
+    # Limit the number of pods to prevent PID exhaustion or ETCD bloat
+    pods: "20"

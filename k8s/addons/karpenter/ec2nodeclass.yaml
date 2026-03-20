@@ -1,0 +1,121 @@
+##########################################################
+# Karpenter EC2NodeClass
+#
+# EC2NodeClass is the AWS-specific configuration that
+# tells Karpenter how to launch EC2 instances:
+#   - Which subnets to use (via tag selector)
+#   - Which security groups to attach (via tag selector)
+#   - Which AMI to use (EKS-optimized, resolved via SSM)
+#   - Which IAM instance profile to assign to nodes
+#
+# EC2NodeClass vs NodePool:
+#   EC2NodeClass = AWS infrastructure config (subnet, AMI, SG)
+#   NodePool     = Kubernetes scheduling config (capacity, limits)
+#
+# Using tag selectors for subnets and SGs means Karpenter
+# discovers them dynamically — no hardcoded IDs that drift
+# when infrastructure is recreated.
+##########################################################
+
+apiVersion: karpenter.k8s.aws/v1beta1
+kind: EC2NodeClass
+metadata:
+  name: default
+  labels:
+    app.kubernetes.io/part-of: enterprise-aws-platform
+spec:
+  ##########################################################
+  # AMI Family
+  #
+  # AL2: Amazon Linux 2 (EKS-optimized)
+  # Karpenter resolves the exact AMI ID from SSM at launch:
+  #   /aws/service/eks/optimized-ami/<k8s-version>/amazon-linux-2/...
+  #
+  # This is a key advantage over hardcoding AMI IDs:
+  # new nodes automatically get patched AMIs without
+  # updating any config files.
+  #
+  # Alternatives: Bottlerocket (container-optimized, no SSH),
+  # Custom (your own hardened AMI)
+  ##########################################################
+  amiFamily: AL2
+
+  ##########################################################
+  # Subnet Selector
+  #
+  # Selects subnets by tag. Karpenter launches nodes in
+  # subnets that match ALL specified tags.
+  # These tags are standard EKS subnet tags:
+  #   kubernetes.io/cluster/<cluster-name>: owned/shared
+  #   kubernetes.io/role/internal-elb: 1 (private subnets)
+  #
+  # Private subnets only — nodes must NOT have public IPs.
+  ##########################################################
+  subnetSelectorTerms:
+    - tags:
+        kubernetes.io/cluster/${EKS_CLUSTER_NAME}: owned
+        kubernetes.io/role/internal-elb: "1"
+
+  ##########################################################
+  # Security Group Selector
+  #
+  # Selects security groups attached to launched nodes.
+  # Uses the tag we set in terraform/modules/eks/main.tf:
+  #   kubernetes.io/cluster/<name>: owned
+  # This ensures Karpenter nodes use the same SG as the
+  # managed node group (correct inbound/outbound rules).
+  ##########################################################
+  securityGroupSelectorTerms:
+    - tags:
+        kubernetes.io/cluster/${EKS_CLUSTER_NAME}: owned
+
+  ##########################################################
+  # IAM Instance Profile
+  #
+  # The instance profile that EC2 instances assume.
+  # This profile wraps the eks_node_group IAM role and
+  # grants nodes permissions for: ECR pulls, VPC CNI,
+  # CloudWatch agent, SSM session manager.
+  #
+  # Created by Terraform: aws_iam_instance_profile.karpenter_node
+  # Get from: terraform output -raw karpenter_node_instance_profile
+  ##########################################################
+  instanceProfile: "${KARPENTER_NODE_INSTANCE_PROFILE}"
+
+  ##########################################################
+  # Block Device Mapping
+  #
+  # Encrypt root EBS volume with KMS.
+  # Default EKS-optimized AMI uses /dev/xvda.
+  # Size: 50 GiB — sufficient for:
+  #   - OS + kubelet: ~5 GiB
+  #   - Container images: ~20 GiB
+  #   - Ephemeral storage: ~25 GiB buffer
+  ##########################################################
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 50Gi
+        volumeType: gp3   # gp3 is cheaper and faster than gp2
+        encrypted: true
+        # KMS default key — replace with your CMK ARN for BYOK
+        # kmsKeyID: "arn:aws:kms:..."
+        deleteOnTermination: true
+
+  ##########################################################
+  # User Data (optional)
+  # Additional bootstrap commands injected into the EKS
+  # node bootstrap script. Leave empty if using AL2 defaults.
+  ##########################################################
+  # userData: |
+  #   #!/bin/bash
+  #   /etc/eks/bootstrap.sh '${EKS_CLUSTER_NAME}'
+
+  tags:
+    ManagedBy:   karpenter
+    Environment: "${ENVIRONMENT}"
+    Cluster:     "${EKS_CLUSTER_NAME}"
+    # FinOps — Cost Attribution
+    cost-center: platform
+    team: backend
+    env: "${ENVIRONMENT}"

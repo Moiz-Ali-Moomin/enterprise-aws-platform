@@ -414,3 +414,131 @@ Pod: api-service
 Application reads os.environ["DATABASE_URL"] — never touches AWS directly
 ```
 
+---
+
+## Failure Validation & Self-Healing
+
+The EKS platform is designed to recover automatically from common failure scenarios.
+
+### Scenario 1: Pod Crash / OOMKill
+- **Detection**: Kubernetes Liveness/Readiness probes.
+- **Action**: Kubelet restarts the container immediately.
+- **Guarantee**: If restarts fail, the Deployment controller recreates the pod on a healthy node.
+
+### Scenario 2: Node Failure / Spot Interruption
+- **Detection**: Karpenter SQS interruption handler + EventBridge.
+- **Action**: Karpenter pro-actively cordons the node and drains pods to new instances.
+- **Guarantee**: Pod Disruption Budget (PDB) ensures `minAvailable: 1` during the move.
+
+### Scenario 3: Traffic Spike (Scale-out)
+- **Detection**: HPA monitors CPU/Memory thresholds.
+- **Action**: HPA increases replica count; Karpenter provisions additional nodes if capacity is exhausted.
+- **Guarantee**: Horizontal scaling prevents resource saturation.
+
+---
+
+## Disaster Recovery (DR) Strategy
+
+Our DR strategy follows a **Multi-Region Pilot Light** or **Backup & Restore** pattern depending on the RTO/RPO requirements.
+
+### Principles:
+1. **Stateless Compute**: EKS clusters are treated as ephemeral. All cluster configuration is in Git (Infrastructure as Code).
+2. **External State**: All persistent data is stored in RDS (Postgres), S3, or DynamoDB — never on Kubernetes worker nodes.
+3. **Cluster Recreation**: In a total region failure, the entire foundation (VPC, EKS) can be redeployed via Terraform in a secondary region.
+4. **Data Replication**: RDS Cross-Region Read Replicas are used for data durability.
+
+### Backup Tools:
+- **Velero**: Optionally used for cluster-level resource backups (CRDs, secrets, namespaces) to S3.
+- **KMS**: All backups are encrypted using regional KMS keys.
+
+---
+
+## Upgrade Strategy (Zero-Downtime)
+
+We maintain a "N-1" versioning strategy for EKS clusters to ensure stability while staying current.
+
+### EKS Version Upgrades:
+- **Control Plane**: Upgraded via Terraform (`kubernetes_version` variable). AWS handles the rolling update of the control plane API.
+- **Data Plane (Managed Nodes)**: EKS Managed Node Groups use a rolling update strategy (one node at a time).
+- **Data Plane (Karpenter)**: Nodes are cycled automatically via `expireAfter: 720h` or by updating the `EC2NodeClass` AMI.
+
+### Availability Guards:
+- **Pod Disruption Budget (PDB)**: Prevents the eviction of too many pods simultaneously during node upgrades.
+- **Anti-Affinity**: Ensures replicas are spread across multiple nodes and Availability Zones.
+- **MaxSurge / MaxUnavailable**: Deployment strategy tuned for zero-downtime rolling updates.
+
+
+---
+
+## Node Scaling Strategy (EKS)
+
+EKS uses a **two-layer autoscaling architecture**. Both layers are required for a complete production system:
+
+### Layer 1: HPA — Pod Autoscaling
+
+HPA (Horizontal Pod Autoscaler) answers: **"How many pods should this deployment have?"**
+
+```
+Pod CPU > 70%  OR  Pod Memory > 80%
+  → HPA controller detects metric threshold breach
+    → HPA increases Deployment replicas
+      → New pods created → Kubernetes scheduler looks for a node
+        → If no node has capacity:
+            → Pod stuck in "Pending" state
+              → Karpenter detects Pending pod and provisions a node
+```
+
+HPA is reactive to **application-level demand**. It operates at the Kubernetes object level.
+
+### Layer 2: Karpenter — Node Autoscaling
+
+Karpenter answers: **"How many/what type of EC2 nodes should the cluster have?"**
+
+```
+Pod enters Pending state (unschedulable)
+  → Karpenter scans the Pending pod's resource requests
+    → Karpenter queries EC2 for cheapest available instance
+       that fits the pod's CPU/memory/zone/capacity-type requirements
+        → EC2 instance launched (< 60 seconds typically)
+          → Node joins cluster via bootstrap script
+            → Pod scheduled on new node
+              → Service resumes normal operation
+```
+
+**Scale-in (Consolidation):**
+```
+Node CPU + memory utilization drops
+  → Karpenter consolidation checks: can pods fit on other nodes?
+    → Yes: cordon node → drain pods → terminate EC2 instance → cost eliminated
+    → No: leave node running
+```
+
+### Why Karpenter over Cluster Autoscaler?
+
+| Capability | Cluster Autoscaler | Karpenter |
+|---|---|---|
+| **Scale-out speed** | 5–15 min (ASG cooldowns) | < 60 seconds (direct EC2 API) |
+| **Instance flexibility** | Fixed types in ASG config | Any type from allowed families at launch |
+| **Spot interruption** | Cordons node on CloudWatch event | Proactive drain via SQS 2-min warning |
+| **Node consolidation** | ❌ Doesn't merge underutilized nodes | ✅ Bin-packs pods, terminates underutilized nodes |
+| **Cost optimization** | Scale out/in only | Right-sizes + eliminates idle capacity |
+| **AMI management** | Static AMI in launch template | Dynamic SSM resolution (always patched) |
+
+### Spot Interruption Handling (Karpenter)
+
+```
+AWS sends 2-minute Spot interruption warning
+  → EC2 Spot Interruption Warning event → EventBridge
+    → SQS queue (karpenter-interruption)
+      → Karpenter controller receives message
+        → Cordon node (no new pods)
+          → Drain node (evict pods gracefully)
+            → Pod eviction triggers PDB check
+              → PDB ensures minAvailable=1 pods remain
+                → New pod scheduled on another node/Spot instance
+                  → EC2 terminates original instance
+```
+
+**This flow eliminates the main Spot risk**: without Karpenter's interruption handler, Spot terminations are sudden with no graceful pod shutdown.
+
+

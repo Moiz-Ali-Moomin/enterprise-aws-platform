@@ -5,6 +5,10 @@ metadata:
   namespace: api-service
   labels:
     app: api-service
+    # FinOps labels
+    cost-center: platform
+    team: backend
+    env: "${ENVIRONMENT}"
     version: "${IMAGE_TAG}"
     app.kubernetes.io/name: api-service
     app.kubernetes.io/part-of: enterprise-aws-platform

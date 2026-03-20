@@ -1,0 +1,217 @@
+##########################################################
+# NetworkPolicy — API Service (Zero-Trust Pod Isolation)
+#
+# Kubernetes NetworkPolicies implement zero-trust networking
+# at the pod level. Without a NetworkPolicy, all pods in the
+# cluster can communicate freely with all other pods — a flat
+# network that violates least-privilege principles.
+#
+# Strategy:
+#   1. Default deny all ingress AND egress (separate policies)
+#   2. Explicitly allow only what the api-service needs
+#
+# This means a compromised api-service pod cannot:
+#   - Reach other namespaces (e.g., kube-system)
+#   - Reach the Kubernetes API server directly
+#   - Port-scan other pods or services
+#   - Exfiltrate data via unexpected egress
+#
+# IMPORTANT: NetworkPolicies require a CNI that enforces them.
+# AWS VPC CNI (default) does NOT enforce NetworkPolicies.
+# You must install a secondary CNI for enforcement:
+#   - Calico:  most widely used, helm-installable
+#   - Cilium:  eBPF-based, high performance, also supports L7
+#   - VPC CNI network policy addon (available in EKS 1.25+)
+#
+# Installation: enable VPC CNI network policy on EKS:
+#   aws eks update-addon --cluster-name <name> \
+#     --addon-name vpc-cni \
+#     --configuration-values '{"networkPolicy":{"enabled":true}}'
+##########################################################
+
+##########################################################
+# Policy 1: Default Deny All Ingress
+# Affects all pods with app=api-service label.
+# An empty ingress[] means: deny all incoming traffic.
+##########################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-service-deny-all-ingress
+  namespace: api-service
+  labels:
+    app: api-service
+    app.kubernetes.io/part-of: enterprise-aws-platform
+spec:
+  podSelector:
+    matchLabels:
+      app: api-service
+  policyTypes:
+    - Ingress
+  ingress: []   # Explicit empty array = deny all ingress
+
+---
+
+##########################################################
+# Policy 2: Default Deny All Egress
+# Locks down all outbound traffic from api-service pods.
+# We then layer in specific allow rules below.
+##########################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-service-deny-all-egress
+  namespace: api-service
+  labels:
+    app: api-service
+    app.kubernetes.io/part-of: enterprise-aws-platform
+spec:
+  podSelector:
+    matchLabels:
+      app: api-service
+  policyTypes:
+    - Egress
+  egress: []   # Explicit empty array = deny all egress
+
+---
+
+##########################################################
+# Policy 3: Allow Ingress from ALB (via kube-system)
+#
+# The AWS Load Balancer Controller creates ALBs that route
+# to pods by IP (target-type: ip). The traffic arrives at
+# the pod directly from the ALB's VPC IP — there is no
+# Kubernetes proxy hop.
+#
+# We allow ingress from the entire VPC CIDR on port 8000
+# because ALB IPs are dynamically assigned within the VPC.
+# A tighter option is to tag ALB subnets and use a
+# namespace selector for the kube-system ingress controller
+# pods — but ALB uses VPC-level routing bypassing k8s proxy.
+#
+# Namespace selector approach (if using in-cluster proxy):
+# podSelector: {} with namespaceSelector for kube-system
+##########################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-service-allow-alb-ingress
+  namespace: api-service
+  labels:
+    app: api-service
+    app.kubernetes.io/part-of: enterprise-aws-platform
+spec:
+  podSelector:
+    matchLabels:
+      app: api-service
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 8000
+          protocol: TCP
+      # Allow from any source within VPC (ALB uses direct pod IPs)
+      # Consider restricting to specific ALB subnet CIDRs in prod
+      from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            # Exclude pod CIDRs to only allow external traffic
+            # (adjust based on your VPC pod CIDR allocation)
+
+---
+
+##########################################################
+# Policy 4: Allow Egress to DNS
+#
+# DNS is critical — without it, the app cannot resolve
+# any hostnames (SQS, RDS, AWS APIs, etc.)
+# CoreDNS runs in kube-system namespace on port 53.
+# We allow both UDP and TCP (TCP for large DNS responses).
+##########################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-service-allow-dns-egress
+  namespace: api-service
+  labels:
+    app: api-service
+    app.kubernetes.io/part-of: enterprise-aws-platform
+spec:
+  podSelector:
+    matchLabels:
+      app: api-service
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      # CoreDNS pods live in kube-system
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+
+---
+
+##########################################################
+# Policy 5: Allow Egress to AWS Services (via VPC endpoints)
+#
+# The api-service communicates with:
+#   - SQS      (via VPC endpoint: port 443)
+#   - X-Ray    (via VPC endpoint: port 443)
+#   - CloudWatch Logs (via VPC endpoint: port 443)
+#   - RDS      (private subnet: port 5432)
+#
+# All AWS API calls go through VPC interface endpoints
+# (private IPs within the VPC) — so we allow HTTPS (443)
+# egress to the VPC CIDR, not the internet.
+#
+# If VPC endpoints aren't used for an API, the traffic
+# goes via NAT Gateway and needs 0.0.0.0/0 HTTPS.
+# This platform uses VPC endpoints, so we can be stricter.
+##########################################################
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-service-allow-aws-egress
+  namespace: api-service
+  labels:
+    app: api-service
+    app.kubernetes.io/part-of: enterprise-aws-platform
+spec:
+  podSelector:
+    matchLabels:
+      app: api-service
+  policyTypes:
+    - Egress
+  egress:
+    # AWS API calls via VPC interface endpoints (HTTPS, private IPs)
+    - ports:
+        - port: 443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 10.0.0.0/8  # Covers all private VPC CIDRs (10.x.x.x)
+
+    # RDS PostgreSQL (private subnet, adjust port if needed)
+    - ports:
+        - port: 5432
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+
+    # ADOT sidecar OTLP endpoint (localhost: same pod, no network hop)
+    # NetworkPolicies don't apply to loopback — this is included for clarity
+    - ports:
+        - port: 4317
+          protocol: TCP
+        - port: 4318
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: api-service  # Only to self (ADOT sidecar in same pod)

@@ -7,6 +7,10 @@ metadata:
     app: api-service
     app.kubernetes.io/name: api-service
     app.kubernetes.io/part-of: enterprise-aws-platform
+    # FinOps labels
+    cost-center: platform
+    team: backend
+    env: "${ENVIRONMENT}"
   annotations:
     # AWS Load Balancer Controller watches this annotation to know which
     # IngressClass (ALB) to manage this Ingress with.
@@ -48,8 +52,9 @@ metadata:
     # Deletion protection — prevent accidental ALB deletion in prod
     # alb.ingress.kubernetes.io/load-balancer-attributes: "deletion_protection.enabled=true"
 
-    # WAF (optional) — associate with WAFv2 Web ACL for OWASP protection
-    # alb.ingress.kubernetes.io/wafv2-acl-arn: "${WAF_ACL_ARN}"
+    # WAFv2 Protection — Associated with the EKS WAFv2 WebACL
+    # Use output: waf_web_acl_arn
+    alb.ingress.kubernetes.io/wafv2-acl-arn: "${WAF_WEB_ACL_ARN}"
 
     # Subnet selection: ALB launches into public subnets.
     # The ALB Controller auto-discovers subnets tagged:
