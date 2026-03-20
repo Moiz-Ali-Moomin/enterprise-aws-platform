@@ -1,0 +1,71 @@
+# External Secrets Operator — Helm Values
+#
+# ESO is the bridge between AWS Secrets Manager and Kubernetes Secrets.
+# It watches ExternalSecret CRs and syncs secrets into K8s Secrets objects.
+#
+# Secrets flow:
+#   AWS Secrets Manager → ESO (via IRSA) → Kubernetes Secret → Pod env var
+#
+# The operator uses IRSA to authenticate to AWS — no static credentials
+# are stored in the cluster. The IRSA role is scoped to read-only access
+# to specific secret paths (/{project}/{env}/*).
+#
+# Reference: https://external-secrets.io/latest/provider/aws-secrets-manager/
+
+# Two replicas for HA — ESO is a critical cluster add-on
+replicaCount: 2
+
+serviceAccount:
+  create: true
+  name: external-secrets
+  annotations:
+    # IRSA annotation — the ESO pods assume this role to call Secrets Manager.
+    # Get from: terraform output -raw external_secrets_role_arn
+    eks.amazonaws.com/role-arn: "${EXTERNAL_SECRETS_IRSA_ROLE_ARN}"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+# Run webhook in HA mode (validates ExternalSecret CRs)
+webhook:
+  replicaCount: 2
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+# Certificate controller (manages webhook TLS certs)
+certController:
+  replicaCount: 1
+
+# Spread replicas across nodes
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: external-secrets
+          topologyKey: kubernetes.io/hostname
+
+# Security context
+securityContext:
+  runAsNonRoot: true
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+
+# Global secret refresh interval default
+# Individual ExternalSecret objects can override this
+global:
+  compatibility:
+    openshift:
+      adaptSecurityContext: "disabled"

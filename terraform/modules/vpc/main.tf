@@ -56,8 +56,50 @@ resource "aws_subnet" "private" {
   }
 }
 
+############################################
+# NAT Gateway Strategy
+#
+# NAT Gateways allow private subnet resources
+# to initiate outbound internet connections
+# (e.g., pulling OS packages, calling external APIs).
+#
+# IMPORTANT: Most AWS API calls (ECR, S3, CloudWatch,
+# SSM, Secrets Manager, SQS, X-Ray) do NOT go through
+# NAT because we use VPC Interface Endpoints. This
+# significantly reduces both NAT cost and attack surface.
+#
+# NAT cost: ~$32/month base + $0.045/GB data processed.
+# With VPC endpoints in place, NAT data volume is minimal
+# (only truly external calls traverse NAT).
+#
+# Strategy per environment:
+#
+#   dev:     Single NAT Gateway (one AZ)
+#            - Saves ~$32/month vs. multi-AZ
+#            - Acceptable: dev downtime is tolerable
+#            - If us-east-1a fails, dev loses NAT access
+#              (but VPC endpoint traffic is unaffected)
+#
+#   staging: Single NAT Gateway (one AZ)
+#            - Same rationale as dev
+#            - Cost savings > availability requirement
+#
+#   prod:    One NAT Gateway per AZ
+#            - Ensures private subnet egress in each AZ
+#              remains independent
+#            - If us-east-1a NAT fails, tasks in us-east-1b
+#              continue using their own NAT (no cross-AZ routing)
+#            - Additional cost (~$32/AZ/month) justified by
+#              production availability SLA
+#
+# To switch between strategies, set nat_gateway_count in
+# the environment tfvars:
+#   nat_gateway_count = 1            → single NAT
+#   nat_gateway_count = len(azs)     → per-AZ (prod default)
+############################################
+
 resource "aws_eip" "nat" {
-  count  = length(var.public_subnet_cidrs)
+  count  = var.nat_gateway_count
   domain = "vpc"
 
   tags = {
@@ -67,7 +109,7 @@ resource "aws_eip" "nat" {
 }
 
 resource "aws_nat_gateway" "main" {
-  count         = length(var.public_subnet_cidrs)
+  count         = var.nat_gateway_count
   allocation_id = aws_eip.nat[count.index].id
   subnet_id     = aws_subnet.public[count.index].id
 
@@ -98,8 +140,11 @@ resource "aws_route_table" "private" {
   vpc_id = aws_vpc.main.id
 
   route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.main[count.index].id
+    cidr_block = "0.0.0.0/0"
+    # If single NAT: all private subnets route through NAT[0]
+    # If multi-AZ NAT: each subnet routes through its AZ-local NAT
+    # This prevents cross-AZ NAT traffic which incurs data transfer costs
+    nat_gateway_id = aws_nat_gateway.main[min(count.index, var.nat_gateway_count - 1)].id
   }
 
   tags = {

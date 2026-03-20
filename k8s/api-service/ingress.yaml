@@ -1,0 +1,74 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-service
+  namespace: api-service
+  labels:
+    app: api-service
+    app.kubernetes.io/name: api-service
+    app.kubernetes.io/part-of: enterprise-aws-platform
+  annotations:
+    # AWS Load Balancer Controller watches this annotation to know which
+    # IngressClass (ALB) to manage this Ingress with.
+    kubernetes.io/ingress.class: "alb"
+
+    # internet-facing: ALB is public-facing (in public subnets).
+    # internal: ALB is private (in private subnets, for service-to-service).
+    alb.ingress.kubernetes.io/scheme: "internet-facing"
+
+    # ip target-type: ALB routes directly to pod IPs, not NodePort.
+    # This eliminates an extra network hop and is required for Fargate nodes.
+    # Pod IPs must be routable within the VPC (true for VPC CNI).
+    alb.ingress.kubernetes.io/target-type: "ip"
+
+    # Listen on HTTPS only — HTTP redirects to HTTPS at the ALB level
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+
+    # Redirect HTTP to HTTPS — same as the ECS ALB listener
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+    # ACM certificate ARN for TLS termination.
+    # Replace with your actual certificate ARN from ACM.
+    # To get it: aws acm list-certificates --region us-east-1
+    alb.ingress.kubernetes.io/certificate-arn: "${ACM_CERTIFICATE_ARN}"
+
+    # TLS 1.3 security policy — matches ECS ALB TLS configuration
+    alb.ingress.kubernetes.io/ssl-policy: "ELBSecurityPolicy-TLS13-1-2-2021-06"
+
+    # Health check settings — ALB will probe /health on pods
+    alb.ingress.kubernetes.io/healthcheck-path: "/health"
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+
+    # Idle connection timeout — match ALB default
+    alb.ingress.kubernetes.io/load-balancer-attributes: "idle_timeout.timeout_seconds=60"
+
+    # Deletion protection — prevent accidental ALB deletion in prod
+    # alb.ingress.kubernetes.io/load-balancer-attributes: "deletion_protection.enabled=true"
+
+    # WAF (optional) — associate with WAFv2 Web ACL for OWASP protection
+    # alb.ingress.kubernetes.io/wafv2-acl-arn: "${WAF_ACL_ARN}"
+
+    # Subnet selection: ALB launches into public subnets.
+    # The ALB Controller auto-discovers subnets tagged:
+    #   kubernetes.io/role/elb: 1 (public)
+    #   kubernetes.io/role/internal-elb: 1 (private)
+    # Tag your VPC subnets with these values for auto-discovery.
+    # Or explicitly specify:
+    # alb.ingress.kubernetes.io/subnets: "subnet-abc123, subnet-def456"
+
+spec:
+  ingressClassName: alb
+  rules:
+    - host: "${API_HOSTNAME}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 80

@@ -38,3 +38,34 @@ variable "alert_email" {
   type        = string
   default     = ""
 }
+
+variable "compute_platform" {
+  description = <<-EOF
+    Selects the compute backend for this environment.
+
+    "ecs" — AWS ECS Fargate (default)
+      - Managed serverless containers
+      - Auto-scaling via ECS Application Auto Scaling
+      - Circuit breaker + automatic rollback
+      - Lower operational overhead
+      - Best for: teams that don't need Kubernetes
+
+    "eks" — Amazon EKS Managed Node Groups
+      - Kubernetes control plane + managed EC2 nodes
+      - IRSA for pod-level IAM (no shared instance credentials)
+      - HPA for pod autoscaling; Cluster Autoscaler for node scaling
+      - AWS Load Balancer Controller for Ingress
+      - External Secrets Operator for Secrets Manager → K8s Secrets
+      - Best for: multi-team platforms, complex scheduling, K8s ecosystem
+
+    Switching platforms destroys only compute resources.
+    Shared infra (VPC, ECR, SQS, RDS, Secrets Manager) is NOT affected.
+  EOF
+  type        = string
+  default     = "ecs"
+
+  validation {
+    condition     = contains(["ecs", "eks"], var.compute_platform)
+    error_message = "compute_platform must be 'ecs' or 'eks'."
+  }
+}

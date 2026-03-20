@@ -14,10 +14,14 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 6.0"
     }
-    # FIX #8: Added — required by global/tags module (null_resource)
     null = {
       source  = "hashicorp/null"
       version = "~> 3.0"
+    }
+    # tls provider required by EKS module to fetch OIDC endpoint thumbprint
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
     }
   }
 }
@@ -63,11 +67,11 @@ module "iam" {
   aws_region         = var.aws_region
   github_repo        = var.github_repo
   ecr_repository_arn = module.ecr.repository_arn
-  kms_key_arn        = module.ecs.kms_key_arn
+  kms_key_arn        = var.compute_platform == "ecs" ? one(module.ecs[*].kms_key_arn) : one(module.eks[*].kms_key_arn)
 }
 
 ############################################
-# ECR
+# ECR (shared)
 ############################################
 
 module "ecr" {
@@ -78,10 +82,11 @@ module "ecr" {
 }
 
 ############################################
-# Load Balancer — No WAF in Dev
+# Load Balancer — No WAF in Dev (ECS only)
 ############################################
 
 module "loadbalancer" {
+  count             = var.compute_platform == "ecs" ? 1 : 0
   source            = "../../modules/loadbalancer"
   project_name      = var.project_name
   environment       = "dev"
@@ -94,18 +99,19 @@ module "loadbalancer" {
 }
 
 ############################################
-# ECS — Minimal Capacity for Dev
+# ECS — Minimal Capacity for Dev (conditional)
 ############################################
 
 module "ecs" {
+  count                 = var.compute_platform == "ecs" ? 1 : 0
   source                = "../../modules/ecs"
   project_name          = var.project_name
   environment           = "dev"
   aws_region            = var.aws_region
   vpc_id                = module.vpc.vpc_id
   private_subnet_ids    = module.vpc.private_subnet_ids
-  target_group_arn      = module.loadbalancer.target_group_arn
-  alb_security_group_id = module.loadbalancer.alb_security_group_id
+  target_group_arn      = one(module.loadbalancer[*].target_group_arn)
+  alb_security_group_id = one(module.loadbalancer[*].alb_security_group_id)
   vpc_cidr              = module.vpc.vpc_cidr
   container_image       = "${module.ecr.repository_url}:latest"
   container_port        = 8000
@@ -121,7 +127,34 @@ module "ecs" {
 }
 
 ############################################
-# SQS — Order Processing Queue
+# EKS — Dev: Spot instances, t3.medium
+# Dev uses Spot for cost savings (70% cheaper)
+# and a single on-demand baseline node.
+############################################
+
+module "eks" {
+  count              = var.compute_platform == "eks" ? 1 : 0
+  source             = "../../modules/eks"
+  project_name       = var.project_name
+  environment        = "dev"
+  aws_region         = var.aws_region
+  vpc_id             = module.vpc.vpc_id
+  vpc_cidr           = module.vpc.vpc_cidr
+  private_subnet_ids = module.vpc.private_subnet_ids
+
+  kubernetes_version  = "1.30"
+  node_instance_types = ["t3.medium"]
+  node_desired_size   = 2
+  node_min_size       = 1
+  node_max_size       = 5
+  enable_spot_nodes   = true # Spot is fine for dev — 70% cheaper
+
+  enable_public_endpoint     = true
+  cluster_log_retention_days = 7 # Lower retention in dev to save cost
+}
+
+############################################
+# SQS (shared)
 ############################################
 
 module "sqs" {
@@ -141,23 +174,24 @@ module "secrets" {
 }
 
 ############################################
-# Monitoring
+# Monitoring (ECS only)
 ############################################
 
 module "monitoring" {
+  count            = var.compute_platform == "ecs" ? 1 : 0
   source           = "../../modules/monitoring"
   project_name     = var.project_name
   environment      = "dev"
   aws_region       = var.aws_region
-  ecs_cluster_name = module.ecs.cluster_name
-  ecs_service_name = module.ecs.service_name
-  alb_arn_suffix   = module.loadbalancer.alb_arn_suffix
-  log_group_name   = module.ecs.log_group_name
+  ecs_cluster_name = one(module.ecs[*].cluster_name)
+  ecs_service_name = one(module.ecs[*].service_name)
+  alb_arn_suffix   = one(module.loadbalancer[*].alb_arn_suffix)
+  log_group_name   = one(module.ecs[*].log_group_name)
   alert_email      = var.alert_email
 }
 
 ############################################
-# VPC Endpoints
+# VPC Endpoints (shared)
 ############################################
 
 module "vpc_endpoints" {

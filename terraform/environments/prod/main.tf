@@ -14,10 +14,14 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 6.0"
     }
-    # FIX #8: Added — required by global/tags module (null_resource)
     null = {
       source  = "hashicorp/null"
       version = "~> 3.0"
+    }
+    # tls provider required by EKS module to fetch OIDC endpoint thumbprint
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.0"
     }
   }
 }
@@ -39,7 +43,16 @@ module "global_tags" {
 }
 
 ############################################
-# Networking
+# Networking (shared — used by BOTH ECS and EKS)
+#
+# VPC, subnets, NAT, and route tables are
+# independent of compute platform. Both ECS
+# tasks and EKS nodes run in private subnets.
+#
+# Subnet tags required for EKS ALB discovery:
+#   Public subnets:  kubernetes.io/role/elb = 1
+#   Private subnets: kubernetes.io/role/internal-elb = 1
+#   Both:            kubernetes.io/cluster/<name> = shared
 ############################################
 
 module "vpc" {
@@ -62,7 +75,10 @@ module "vpc" {
 }
 
 ############################################
-# IAM
+# IAM (shared)
+# ECS task roles live here. EKS IRSA roles
+# live in the EKS module itself (co-located
+# with the OIDC provider they depend on).
 ############################################
 
 module "iam" {
@@ -72,11 +88,13 @@ module "iam" {
   aws_region         = var.aws_region
   github_repo        = var.github_repo
   ecr_repository_arn = module.ecr.repository_arn
-  kms_key_arn        = module.ecs.kms_key_arn
+  # kms_key_arn comes from whichever compute backend is active
+  kms_key_arn = var.compute_platform == "ecs" ? one(module.ecs[*].kms_key_arn) : one(module.eks[*].kms_key_arn)
 }
 
 ############################################
-# ECR
+# ECR (shared — same container image for both
+# ECS tasks and EKS pods)
 ############################################
 
 module "ecr" {
@@ -88,9 +106,14 @@ module "ecr" {
 
 ############################################
 # Load Balancer — HTTPS + WAF
+# Used by ECS. EKS manages its own ALBs via
+# the AWS Load Balancer Controller (Ingress).
+# This module is conditional on ECS to avoid
+# creating an unused ALB when running EKS.
 ############################################
 
 module "loadbalancer" {
+  count             = var.compute_platform == "ecs" ? 1 : 0
   source            = "../../modules/loadbalancer"
   project_name      = var.project_name
   environment       = "prod"
@@ -103,20 +126,30 @@ module "loadbalancer" {
 }
 
 ############################################
-# ECS Cluster + Service
+# ECS — Compute Backend (conditional)
+#
+# Only provisioned when compute_platform = "ecs".
+# Set in prod.tfvars:
+#   compute_platform = "ecs"   # existing behaviour
+#   compute_platform = "eks"   # migrate to EKS
+#
+# Switching between platforms does NOT destroy
+# shared infrastructure (VPC, ECR, SQS, RDS).
+# Only the compute layer changes.
 ############################################
 
 module "ecs" {
+  count                 = var.compute_platform == "ecs" ? 1 : 0
   source                = "../../modules/ecs"
   project_name          = var.project_name
   environment           = "prod"
   aws_region            = var.aws_region
   vpc_id                = module.vpc.vpc_id
   private_subnet_ids    = module.vpc.private_subnet_ids
-  target_group_arn      = module.loadbalancer.target_group_arn
-  alb_security_group_id = module.loadbalancer.alb_security_group_id
+  target_group_arn      = one(module.loadbalancer[*].target_group_arn)
+  alb_security_group_id = one(module.loadbalancer[*].alb_security_group_id)
   vpc_cidr              = module.vpc.vpc_cidr
-  container_image       = ""  # Empty = bootstrap image until CI pushes SHA tag
+  container_image       = "" # Empty = bootstrap image until CI pushes SHA tag
   container_port        = 8000
   execution_role_arn    = module.iam.ecs_task_execution_role_arn
   task_role_arn         = module.iam.ecs_task_role_arn
@@ -130,7 +163,43 @@ module "ecs" {
 }
 
 ############################################
-# SQS — Order Processing Queue
+# EKS — Compute Backend (conditional)
+#
+# Only provisioned when compute_platform = "eks".
+# Includes: cluster, managed node group, OIDC
+# provider, and IRSA roles for ALB Controller,
+# External Secrets Operator, and api-service.
+############################################
+
+module "eks" {
+  count              = var.compute_platform == "eks" ? 1 : 0
+  source             = "../../modules/eks"
+  project_name       = var.project_name
+  environment        = "prod"
+  aws_region         = var.aws_region
+  vpc_id             = module.vpc.vpc_id
+  vpc_cidr           = module.vpc.vpc_cidr
+  private_subnet_ids = module.vpc.private_subnet_ids
+
+  # Production-grade: 2 nodes minimum, on-demand for reliability
+  kubernetes_version = "1.30"
+  node_instance_types = ["t3.large"]
+  node_desired_size   = 2
+  node_min_size       = 2
+  node_max_size       = 10
+  enable_spot_nodes   = false # ON_DEMAND for prod baseline
+
+  # Private-only API endpoint after initial bootstrap
+  enable_public_endpoint = true # Set to false after initial cluster setup
+
+  cluster_log_retention_days = 30
+}
+
+############################################
+# SQS — Order Processing Queue (shared)
+# Both ECS tasks and EKS pods connect to the
+# same SQS queue — no migration needed when
+# switching compute platforms.
 ############################################
 
 module "sqs" {
@@ -140,7 +209,7 @@ module "sqs" {
 }
 
 ############################################
-# Secrets Manager
+# Secrets Manager (shared)
 ############################################
 
 module "secrets" {
@@ -150,23 +219,29 @@ module "secrets" {
 }
 
 ############################################
-# Monitoring — FIX #12: pass aws_region
+# Monitoring — ECS specific metrics
+# Only relevant when ECS is the active backend.
+# EKS monitoring uses CloudWatch Container Insights
+# and the ADOT DaemonSet (deployed via Helm).
 ############################################
 
 module "monitoring" {
+  count            = var.compute_platform == "ecs" ? 1 : 0
   source           = "../../modules/monitoring"
   project_name     = var.project_name
   environment      = "prod"
   aws_region       = var.aws_region
-  ecs_cluster_name = module.ecs.cluster_name
-  ecs_service_name = module.ecs.service_name
-  alb_arn_suffix   = module.loadbalancer.alb_arn_suffix
-  log_group_name   = module.ecs.log_group_name
+  ecs_cluster_name = one(module.ecs[*].cluster_name)
+  ecs_service_name = one(module.ecs[*].service_name)
+  alb_arn_suffix   = one(module.loadbalancer[*].alb_arn_suffix)
+  log_group_name   = one(module.ecs[*].log_group_name)
   alert_email      = var.alert_email
 }
 
 ############################################
-# VPC Endpoints
+# VPC Endpoints (shared)
+# Both ECS and EKS nodes use the same VPC
+# endpoints for ECR, S3, CloudWatch, SSM, etc.
 ############################################
 
 module "vpc_endpoints" {

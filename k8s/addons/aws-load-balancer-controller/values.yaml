@@ -1,0 +1,65 @@
+# AWS Load Balancer Controller — Helm Values
+#
+# Installs the controller that watches Kubernetes Ingress/Service objects
+# and creates/updates AWS ALBs and NLBs accordingly.
+#
+# The controller runs in kube-system and uses IRSA (no static creds).
+# It manages the full lifecycle of ALBs: create, update, delete.
+#
+# Reference chart: https://github.com/aws/eks-charts/tree/master/stable/aws-load-balancer-controller
+
+# Must match your EKS cluster name
+clusterName: "${EKS_CLUSTER_NAME}"
+
+# Two replicas for HA — controller is a critical cluster add-on
+replicaCount: 2
+
+serviceAccount:
+  create: true
+  name: aws-load-balancer-controller
+  annotations:
+    # IRSA: this annotation links the SA to the Terraform-created IAM role.
+    # The controller assumes this role to create/manage ELBv2 resources.
+    # Get this value from: terraform output -raw alb_controller_role_arn
+    eks.amazonaws.com/role-arn: "${ALB_CONTROLLER_IRSA_ROLE_ARN}"
+
+# Resource limits — ALB controller is a lightweight Go binary
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# Security context — run as non-root, read-only filesystem
+securityContext:
+  runAsNonRoot: true
+  readOnlyRootFilesystem: true
+
+# Spread controller replicas across nodes for HA
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: aws-load-balancer-controller
+          topologyKey: kubernetes.io/hostname
+
+# Keep default log level for production (0=info, 1=debug)
+logLevel: info
+
+# Region where the controller creates ALBs
+region: "${AWS_REGION}"
+
+# VPC ID for the EKS cluster — required for subnet discovery
+vpcId: "${VPC_ID}"
+
+# Enable WAFv2 integration (optional — associate Web ACLs via Ingress annotations)
+enableWaf: false
+enableWafv2: true
+
+# Shield Advanced protection (optional)
+enableShield: false

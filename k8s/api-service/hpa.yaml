@@ -1,0 +1,60 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api-service
+  namespace: api-service
+  labels:
+    app: api-service
+    app.kubernetes.io/name: api-service
+    app.kubernetes.io/part-of: enterprise-aws-platform
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: api-service
+
+  # Matches ECS autoscaling bounds: 2–10 tasks/pods
+  minReplicas: 2
+  maxReplicas: 10
+
+  metrics:
+    # CPU-based scaling — reactive to request load
+    # Target 70%: matches ECS CPU autoscaling target.
+    # Leaves 30% headroom for burst before next scale event.
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    # Memory-based scaling — critical for Python apps with memory leaks
+    # Target 80%: memory doesn't compress; act before OOMKill.
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+  behavior:
+    # Scale out aggressively to absorb traffic spikes
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2          # Add up to 2 pods per scaling event
+          periodSeconds: 60
+        - type: Percent
+          value: 50         # Or 50% of current replicas, whichever is larger
+          periodSeconds: 60
+      selectPolicy: Max
+
+    # Scale in conservatively to prevent thrashing
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 5-minute window before scaling in
+      policies:
+        - type: Pods
+          value: 1          # Remove at most 1 pod per scaling event
+          periodSeconds: 120
+      selectPolicy: Min

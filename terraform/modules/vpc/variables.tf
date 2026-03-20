@@ -31,3 +31,21 @@ variable "availability_zones" {
   type        = list(string)
   default     = []
 }
+
+variable "nat_gateway_count" {
+  description = <<-EOF
+    Number of NAT Gateways to create.
+
+    Strategy:
+      1 = Single NAT (dev/staging): cost-optimized, single point of failure for NAT egress.
+          Acceptable when downtime is tolerable and VPC endpoints handle all AWS API traffic.
+      N = Per-AZ NAT (prod): one NAT per public subnet / AZ.
+          Each AZ routes through its local NAT — eliminates cross-AZ traffic and AZ-level SPOF.
+
+    Note: VPC endpoints for ECR, S3, CloudWatch, SSM, etc. bypass NAT entirely.
+    The main cost driver is any remaining internet egress (e.g., external API calls).
+  EOF
+  type        = number
+  default     = 2  # prod default: one per AZ. Override to 1 in dev/staging tfvars.
+}
+

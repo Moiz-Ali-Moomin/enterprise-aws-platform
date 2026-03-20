@@ -1,0 +1,258 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service
+  namespace: api-service
+  labels:
+    app: api-service
+    version: "${IMAGE_TAG}"
+    app.kubernetes.io/name: api-service
+    app.kubernetes.io/part-of: enterprise-aws-platform
+  annotations:
+    # Tells the ALB Ingress controller which deployment to associate
+    app.kubernetes.io/managed-by: "kubectl"
+spec:
+  # 2 replicas for HA — matches ECS desired_count = 2
+  # HPA will override this once CPU/memory targets are exceeded
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: api-service
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxSurge: 1 extra pod during deploy — ensures capacity isn't reduced
+      maxSurge: 1
+      # maxUnavailable: 0 — zero-downtime deploys; never reduce below desired
+      maxUnavailable: 0
+
+  template:
+    metadata:
+      labels:
+        app: api-service
+        version: "${IMAGE_TAG}"
+      annotations:
+        # Prometheus scraping (picked up by ADOT Collector DaemonSet or ServiceMonitor)
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # IRSA: pod's projected service account token is used to assume the
+      # api-service IRSA role. No node-level permissions bleed into pods.
+      serviceAccountName: api-service
+
+      # Never schedule two replicas on the same node (pod anti-affinity)
+      # This ensures one node failure doesn't take down all replicas.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - api-service
+                topologyKey: kubernetes.io/hostname
+
+      # Topology spread: distribute across AZs for resilience
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: api-service
+
+      initContainers: []
+
+      containers:
+        ##############################################################
+        # Primary Application Container
+        ##############################################################
+        - name: api-service
+          # Image is templated — CI/CD substitutes actual ECR URI + SHA tag
+          # Example: 123456789012.dkr.ecr.us-east-1.amazonaws.com/project-prod:sha-abc1234
+          image: "${ECR_REPOSITORY_URL}:${IMAGE_TAG}"
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          env:
+            - name: ENVIRONMENT
+              value: "${ENVIRONMENT}"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://localhost:4317"
+            - name: OTEL_SERVICE_NAME
+              value: "api-service-${ENVIRONMENT}"
+            # Database URL injected from K8s Secret (created by External Secrets Operator)
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: api-service-secrets
+                  key: DATABASE_URL
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: api-service-secrets
+                  key: SECRET_KEY
+            - name: SQS_QUEUE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: api-service-secrets
+                  key: SQS_QUEUE_URL
+
+          # Resource requests: guaranteed to be available on the node.
+          # Resource limits: hard ceiling — container OOMKilled if exceeded.
+          # Request/limit ratio: set limits 2–4× requests to allow burst
+          # without over-provisioning guaranteed capacity.
+          resources:
+            requests:
+              cpu: "256m"       # 0.25 vCPU guaranteed
+              memory: "256Mi"   # 256 MiB guaranteed
+            limits:
+              cpu: "1000m"      # 1 vCPU max burst
+              memory: "1Gi"     # 1 GiB max — OOMKilled if exceeded
+
+          # Readiness probe: pod receives traffic only when this passes.
+          # ALB target returns healthy only for pods with ready=true.
+          # initialDelaySeconds: give the app time to start before probing.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
+
+          # Liveness probe: kubelet restarts the pod if this fails.
+          # Higher threshold than readiness to avoid restart storms on load spikes.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 5
+
+          # Runtime security — mirrors ECS container hardening
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534           # nobody — same as ECS container
+            runAsGroup: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+          # Writable temp directory for app scratch space (readOnly rootfs requires this)
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+        ##############################################################
+        # ADOT Sidecar — OpenTelemetry Collector
+        #
+        # Mirrors the ECS ADOT sidecar exactly — same image, same config.
+        # Receives OTLP from the app on localhost:4317.
+        # Exports traces → X-Ray, metrics → CloudWatch EMF.
+        # Using IRSA on the ServiceAccount gives this sidecar the same
+        # X-Ray + CloudWatch permissions as the app container.
+        ##############################################################
+        - name: adot-collector
+          image: public.ecr.aws/aws-observability/aws-otel-collector:v0.40.0
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+              protocol: TCP
+            - name: otlp-http
+              containerPort: 4318
+              protocol: TCP
+
+          env:
+            - name: AWS_REGION
+              value: "${AWS_REGION}"
+            # Inline ADOT config — same pipeline as ECS (otlp → batch → xray/emf)
+            - name: AOT_CONFIG_CONTENT
+              value: |
+                extensions:
+                  health_check:
+
+                receivers:
+                  otlp:
+                    protocols:
+                      grpc:
+                        endpoint: 0.0.0.0:4317
+                      http:
+                        endpoint: 0.0.0.0:4318
+
+                processors:
+                  batch/traces:
+                    timeout: 1s
+                    send_batch_size: 50
+                  batch/metrics:
+                    timeout: 60s
+
+                exporters:
+                  awsxray:
+                  awsemf:
+                    log_group_name: '/eks/${ENVIRONMENT}/metrics'
+                    log_stream_name: 'otel-metrics'
+
+                service:
+                  pipelines:
+                    traces:
+                      receivers: [otlp]
+                      processors: [batch/traces]
+                      exporters: [awsxray]
+                    metrics:
+                      receivers: [otlp]
+                      processors: [batch/metrics]
+                      exporters: [awsemf]
+                  extensions: [health_check]
+
+          resources:
+            requests:
+              cpu: "64m"
+              memory: "128Mi"
+            limits:
+              cpu: "256m"
+              memory: "256Mi"
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        # Emptydir /tmp: provides scratch space with readOnly rootfs
+        # tmpfs backed — data is in memory, not on the container FS
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+
+      # Graceful termination: allow 30s for in-flight requests to complete
+      terminationGracePeriodSeconds: 30
+
+      # Security context at pod level
+      securityContext:
+        fsGroup: 65534

@@ -129,7 +129,7 @@ variable "kms_key_arn" {
 }
 
 variable "adot_config_yaml" {
-  # FIX #15: ADOT config content — stored in SSM and mounted into sidecar
+  # ADOT config content — stored in SSM and mounted into sidecar
   description = "ADOT Collector YAML configuration content"
   type        = string
   default     = <<-ADOT
@@ -169,4 +169,52 @@ variable "adot_config_yaml" {
           exporters: [awsemf]
       extensions: [health_check]
   ADOT
+}
+
+############################################
+# Capacity Provider Variables
+############################################
+
+variable "fargate_base_capacity" {
+  description = "Minimum number of tasks to run on guaranteed FARGATE (not FARGATE_SPOT). These tasks are always available and provide baseline HA. Should be >= 1."
+  type        = number
+  default     = 1
+}
+
+variable "fargate_spot_weight" {
+  description = "Relative weight for FARGATE_SPOT in the capacity provider strategy for scale-out tasks. Higher values bias toward Spot. Set to 0 to disable Spot entirely."
+  type        = number
+  default     = 3
+}
+
+############################################
+# Health Check Grace Period
+############################################
+
+variable "health_check_grace_period_seconds" {
+  description = "Seconds to ignore ALB health check failures after a task starts. Must be >= container healthCheck startPeriod. Set high enough for your app's startup time."
+  type        = number
+  default     = 60
+}
+
+############################################
+# SQS Queue-Depth Autoscaling (Workers)
+############################################
+
+variable "enable_sqs_scaling" {
+  description = "Enable SQS queue-depth autoscaling. Set to true for worker services that consume from SQS. Set to false for API services (use CPU/memory scaling instead)."
+  type        = bool
+  default     = false
+}
+
+variable "sqs_queue_name" {
+  description = "SQS queue name for queue-depth autoscaling metric. Required when enable_sqs_scaling = true."
+  type        = string
+  default     = ""
+}
+
+variable "sqs_scaling_target_messages_per_task" {
+  description = "Target number of visible SQS messages per running ECS task. ECS scales out when messages/tasks exceeds this value. Lower values = more aggressive scaling."
+  type        = number
+  default     = 50
 }

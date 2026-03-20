@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: api-service
+  labels:
+    # Required by Network Policies to reference this namespace
+    kubernetes.io/metadata.name: api-service
+    environment: "${ENVIRONMENT}"
+    app.kubernetes.io/part-of: enterprise-aws-platform
+    # This annotation enables ADOT pod discovery for CloudWatch Container Insights
+    # and tells the ADOT collector to scrape Prometheus metrics from pods in this namespace
+    aws.amazon.com/cloudwatch-agent-scrape-interval: "30s"
